@@ -47,8 +47,8 @@ class ArxivPapers(AlignmentDataset):
         Fetch entries
             - Check if entry is already done
             - Get metadata from arxiv
-            - Get markdown from arxiv-vanity
-            - Strip markdown
+            - Download PDF and process with grobid
+            - Extract text from grobid response
             - Write to jsonl
         output:
             - jsonl file with entries
@@ -94,11 +94,11 @@ class ArxivPapers(AlignmentDataset):
             yield new_entry
             time.sleep(self.COOLDOWN)
 
-    def _get_vanity_link(self, paper_id) -> str:
+    def _get_pdf_link(self, paper_id) -> str:
         """
-        Get arxiv vanity link
+        Get arxiv PDF link
         """
-        return f"https://www.arxiv-vanity.com/papers/{paper_id}"
+        return f"https://arxiv.org/pdf/{paper_id}.pdf"
 
     def _get_arxiv_link(self, paper_id) -> str:
         """
@@ -108,37 +108,94 @@ class ArxivPapers(AlignmentDataset):
 
     def _strip_markdown(self, markdown) -> str:
         """
-        Strip markdown
+        Strip markdown - updated for arXiv HTML (not arxiv-vanity)
         """
-        s_markdown = markdown.split("don’t have to squint at a PDF")[1]
-        return s_markdown.split("\nReferences\n")[0].replace("\n\n", "\n")
+        # For arXiv HTML, try to extract main content
+        # Look for common section markers
+        if "Abstract" in markdown:
+            # Split after abstract and before references/acknowledgments
+            parts = markdown.split("Abstract", 1)
+            if len(parts) > 1:
+                content = parts[1]
+                # Remove references section if it exists
+                ref_splits = content.split("\nReferences\n")
+                content = ref_splits[0]
+                # Remove acknowledgments if they exist
+                ack_splits = content.split("\nAcknowledgments\n")
+                content = ack_splits[0]
+                return content.replace("\n\n", "\n").strip()
+        # Fallback: return most of the content, removing obvious non-paper parts
+        return markdown.replace("\n\n", "\n").strip()
 
     def _is_dud(self, markdown) -> bool:
         """
-        Check if markdown is a dud
+        Check if markdown is a dud - updated for arXiv HTML
         """
-        if "Paper Not Renderable" in markdown:
+        # Check if it's too short (likely not a full paper)
+        if len(markdown.strip()) < 500:
             return True
-        if "don’t have to squint at a PDF" not in markdown:
+        # Check for error messages
+        if "404" in markdown or "not found" in markdown.lower():
+            return True
+        # Check if it looks like an abstract-only page
+        if "Abstract" in markdown and len(markdown.split()) < 100:
             return True
         return False
 
     def process_id(self, paper_id) -> str:
         """
-        Process arxiv id
+        Process arxiv id using PDF and grobid
         """
-        v_link = self._get_vanity_link(paper_id)
-        logger.info(f"Fetching {v_link}")
-        try:
-            r = requests.get(v_link, timeout=5 * self.COOLDOWN)
-        except Exception as e:
-            logger.error(e)
-            return None
-        markdown = markdownify(r.content)
-        if self._is_dud(markdown):
-            return None
+        pdf_link = self._get_pdf_link(paper_id)
+        logger.info(f"Fetching PDF: {pdf_link}")
 
-        mardown_excerpt = markdown.replace('\n', '')[:100]
-        logger.info(f"Stripping markdown, {mardown_excerpt}")
-        s_markdown = self._strip_markdown(markdown)
-        return s_markdown
+        try:
+            # Download PDF
+            pdf_response = requests.get(pdf_link, timeout=10 * self.COOLDOWN)
+            if pdf_response.status_code == 404:
+                logger.info(f"PDF not available for {paper_id}, skipping")
+                return None
+            pdf_response.raise_for_status()
+
+            # Send to grobid for processing
+            grobid_url = "http://localhost:8070/api/processFulltextDocument"
+            files = {'input': ('paper.pdf', pdf_response.content, 'application/pdf')}
+            # Try without Accept header, or try 'application/xml'
+            headers = {'Accept': 'application/xml'}
+
+            grobid_response = requests.post(grobid_url, files=files, headers=headers, timeout=60)
+
+            if grobid_response.status_code != 200:
+                logger.error(f"Grobid processing failed for {paper_id}: {grobid_response.status_code} - {grobid_response.text[:200]}")
+                return None
+
+            # Parse XML response instead of JSON
+            try:
+                from xml.etree import ElementTree as ET
+                root = ET.fromstring(grobid_response.text)
+
+                # Extract text from grobid TEI XML format
+                # Look for body text in the XML structure
+                body = root.find('.//{http://www.tei-c.org/ns/1.0}body')
+                if body is not None:
+                    text_parts = []
+                    for p in body.findall('.//{http://www.tei-c.org/ns/1.0}p'):
+                        if p.text:
+                            text_parts.append(p.text)
+                    text = ' '.join(text_parts)
+                else:
+                    text = grobid_response.text  # fallback
+
+                if not text or len(text.strip()) < 500:
+                    logger.info(f"Insufficient text extracted for {paper_id}")
+                    return None
+
+                return text.strip()
+
+            except Exception as e:
+                logger.error(f"XML parsing failed for {paper_id}: {e}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Failed to process {paper_id}: {e}")
+            return None

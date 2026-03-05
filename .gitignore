@@ -116,6 +116,7 @@ carado.moe/
 *.txt
 *.xml
 *.docx
-*.md
-*.txt
 *.epub
+# Allow README and replication markdown files
+!README.md
+!replication-*.md

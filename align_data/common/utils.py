@@ -30,7 +30,7 @@ class EntryWriter:
         txt_file = os.path.join(path, name + '.txt')
 
         self.jsonl_writer = jsonlines.open(jsonl_file, mode='a') if not overwrite else jsonlines.open(jsonl_file, mode='w')
-        self.text_writer = open(txt_file, mode='a') if not overwrite else open(txt_file, 'w')
+        self.text_writer = open(txt_file, mode='a', encoding='utf-8') if not overwrite else open(txt_file, 'w', encoding='utf-8')
         self.entry_idx = 0
 
     def __enter__(self):
